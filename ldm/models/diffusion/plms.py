@@ -14,6 +14,7 @@ class PLMSSampler(object):
         self.model = model
         self.ddpm_num_timesteps = model.num_timesteps
         self.schedule = schedule
+        self.verbose = kwargs.get('verbose')
 
     def register_buffer(self, name, attr):
         if type(attr) == torch.Tensor:
@@ -76,6 +77,7 @@ class PLMSSampler(object):
                log_every_t=100,
                unconditional_guidance_scale=1.,
                unconditional_conditioning=None,
+               disable_inner_tqdm=False,
                # this has to come in the same format as the conditioning, # e.g. as encoded tokens, ...
                **kwargs
                ):
@@ -92,7 +94,8 @@ class PLMSSampler(object):
         # sampling
         C, H, W = shape
         size = (batch_size, C, H, W)
-        print(f'Data shape for PLMS sampling is {size}')
+        if self.verbose:
+            print(f'Data shape for PLMS sampling is {size}')
 
         samples, intermediates = self.plms_sampling(conditioning, size,
                                                     callback=callback,
@@ -108,6 +111,7 @@ class PLMSSampler(object):
                                                     log_every_t=log_every_t,
                                                     unconditional_guidance_scale=unconditional_guidance_scale,
                                                     unconditional_conditioning=unconditional_conditioning,
+                                                    disable_inner_tqdm=disable_inner_tqdm,
                                                     )
         return samples, intermediates
 
@@ -117,7 +121,7 @@ class PLMSSampler(object):
                       callback=None, timesteps=None, quantize_denoised=False,
                       mask=None, x0=None, img_callback=None, log_every_t=100,
                       temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None,
-                      unconditional_guidance_scale=1., unconditional_conditioning=None,):
+                      unconditional_guidance_scale=1., unconditional_conditioning=None,disable_inner_tqdm=False,):
         device = self.model.betas.device
         b = shape[0]
         if x_T is None:
@@ -134,9 +138,11 @@ class PLMSSampler(object):
         intermediates = {'x_inter': [img], 'pred_x0': [img]}
         time_range = list(reversed(range(0,timesteps))) if ddim_use_original_steps else np.flip(timesteps)
         total_steps = timesteps if ddim_use_original_steps else timesteps.shape[0]
-        print(f"Running PLMS Sampling with {total_steps} timesteps")
 
-        iterator = tqdm(time_range, desc='PLMS Sampler', total=total_steps)
+        if self.verbose:
+            print(f"Running PLMS Sampling with {total_steps} timesteps")
+
+        iterator = tqdm(time_range, desc='PLMS Sampler', total=total_steps, disable=disable_inner_tqdm)
         old_eps = []
 
         for i, step in enumerate(iterator):
