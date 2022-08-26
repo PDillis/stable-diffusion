@@ -8,6 +8,7 @@ from typing import Union
 
 import torch
 import numpy as np
+import random
 from pyperlin import FractalPerlin2D
 
 from omegaconf import OmegaConf
@@ -21,7 +22,6 @@ except ImportError:
 
 from einops import rearrange
 
-from pytorch_lightning import seed_everything
 from torch import autocast
 from contextlib import nullcontext
 
@@ -119,6 +119,7 @@ def make_run_dir(outdir: Union[str, os.PathLike], desc: str, dry_run: bool = Fal
 # Additional settings
 @click.option('--outdir', type=click.STRING, help='Output directory', default=os.path.join(os.getcwd(), 'out', 'perlin_interpolation'), show_default=True)
 @click.option('--description', '-desc', type=str, help='Additional description name for the directory path to save results', default=None, show_default=True)
+@click.option('--verbose', is_flag=True, help='Print out additional information')
 def main(ctx,
          prompt: str,
          seed: int,
@@ -145,10 +146,17 @@ def main(ctx,
          duration_sec: float,
          reverse_video: bool,
          outdir: Union[str, os.PathLike],
-         description: str):
+         description: str,
+         verbose: bool):
     """Interpolate around a prompt via adding Perlin noise to the original noise."""
-    # Same as before, so let's leave seed_everything, much to my chagrin
-    seed_everything(seed)
+    # Remove seed_everything
+    os.environ["PL_GLOBAL_SEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    if verbose:
+        print(f'Global seed set to {seed}')
 
     # Load config and model
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -204,7 +212,11 @@ def main(ctx,
                     start_code = start_code_copy.clone() + perlin_strength[idx] * perlin_noise
 
                     if deterministic:
-                        seed_everything(seed)
+                        os.environ["PL_GLOBAL_SEED"] = str(seed)
+                        random.seed(seed)
+                        np.random.seed(seed)
+                        torch.manual_seed(seed)
+                        torch.cuda.manual_seed_all(seed)
 
                     samples_ddim, _ = sampler.sample(S=ddim_steps,
                                                      conditioning=c,
