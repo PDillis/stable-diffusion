@@ -100,6 +100,7 @@ def make_run_dir(outdir: Union[str, os.PathLike], desc: str, dry_run: bool = Fal
 @click.option('--ddim-steps', type=click.IntRange(min=1), help='Number of DDIM sampling steps', default=50, show_default=True)
 @click.option('--ddim-eta', type=click.FLOAT, help='DDIM eta (eta = 0.0 corresponds to deterministic sampling', default=0.0, show_default=True)
 @click.option('--num-iter', '-n-iter', type=click.INT, help='Sample this often', default=2, show_default=True)
+@click.option('--deterministic', is_flag=True, help='Set the seed at the start of every frame')
 # @click.option('--num-samples', '-n-samples', type=click.IntRange(min=1), help='Batch size; how many samples to produce per prompt', default=3, show_default=True)
 @click.option('--height', '-H', 'height', type=parse_resolution, help='Height of image (must be divisible by 32)', default=512, show_default=True)
 @click.option('--width', '-W', 'width', type=parse_resolution, help='Width of image (must be divisible by 32)', default=512, show_default=True)
@@ -129,6 +130,7 @@ def main(ctx,
          ddim_steps: int,
          ddim_eta: float,
          num_iter: int,
+         deterministic: bool,
          # num_samples: int,
          height: int,
          width: int,
@@ -200,6 +202,9 @@ def main(ctx,
 
                 for idx, frame in enumerate(tqdm(range(num_frames), desc='Interpolating...', unit='frame')):
                     start_code = start_code_copy.clone() + perlin_strength[idx] * perlin_noise
+
+                    if deterministic:
+                        seed_everything(seed)
 
                     samples_ddim, _ = sampler.sample(S=ddim_steps,
                                                      conditioning=c,
