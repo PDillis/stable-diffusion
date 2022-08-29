@@ -10,6 +10,7 @@ import torch
 import numpy as np
 import random
 from pyperlin import FractalPerlin2D
+import scipy.ndimage
 
 from omegaconf import OmegaConf
 from PIL import Image
@@ -93,6 +94,7 @@ def make_run_dir(outdir: Union[str, os.PathLike], desc: str, dry_run: bool = Fal
 @click.option('--seed', type=click.INT, help='Global seed for random number generator.', default=0, show_default=True)
 @click.option('--config', type=click.Path(exists=True), help='Path to config file which constructs the model.', default=os.path.join(os.getcwd(), 'configs', 'stable-diffusion', 'v1-inference.yaml'), show_default=True)
 @click.option('--ckpt', type=click.Path(exists=True), help='Path to checkpoint of the model.', default=os.path.join('models', 'ldm', 'stable-diffusion-v1', 'model.ckpt'), show_default=True)
+@click.option('--half', is_flag=True, help='Use half precision/fp16.')
 @click.option('--precision', type=click.Choice(['full', 'autocast']), help='Evaluate the model at this precision.', default='autocast', show_default=True)
 @click.option('--scale', type=click.FLOAT, help='Unconditional guidance scale: eps = eps(x, empty) + scale * (eps(x, cond) - eps(x, empty)).', default=7.5, show_default=True)
 # Image synthesis options
@@ -125,6 +127,7 @@ def main(ctx,
          seed: int,
          config: Union[str, os.PathLike],
          ckpt: Union[str, os.PathLike],
+         half: bool,
          precision: str,
          scale: float,
          plms: bool,
@@ -147,7 +150,8 @@ def main(ctx,
          reverse_video: bool,
          outdir: Union[str, os.PathLike],
          description: str,
-         verbose: bool):
+         verbose: bool,
+         smoothing_sec: float = 1.0):
     """Interpolate around a prompt via adding Perlin noise to the original noise."""
     # Remove seed_everything
     os.environ["PL_GLOBAL_SEED"] = str(seed)
@@ -164,6 +168,10 @@ def main(ctx,
     config = OmegaConf.load(config)
     model = load_model_from_config(config, ckpt).to(device)
 
+    # Enable half-precision
+    if half:
+        model.half()
+
     # Sampler; use PLMS or DDIM
     sampler = PLMSSampler(model, verbose=False) if plms else DDIMSampler(model, verbose=False)
 
@@ -172,23 +180,35 @@ def main(ctx,
 
     # Make the output directory
     desc = f'perlin_interpolation-seed{seed}'
+    desc = f'{desc}-PLMS' if plms else f'{desc}-DDIM'
     desc = f'{desc}-{description}' if description is not None else desc
     run_dir = make_run_dir(outdir, desc)
 
-    # TODO: Optimize this! Use a larger batch size to speed this up
-    # Noise shape
-    batch_size = 1
-    noise_shape = (batch_size, channels, height // downsample_factor, width // downsample_factor)
-
     # Starting noise and Perlin noise (both fixed)
-    perlin_seed = seed if perlin_seed is None else perlin_seed
-    perlin_noise = generate_perlin_noise(seed=perlin_seed, device=device, persistence=persistence,
-                                         lacunarity=lacunarity, shape=noise_shape)
-    start_code = torch.randn(noise_shape, device=device)
-    start_code_copy = copy.deepcopy(start_code)
+    # perlin_seed = seed if perlin_seed is None else perlin_seed
+    # perlin_noise = generate_perlin_noise(seed=perlin_seed, device=device, persistence=persistence,
+    #                                      lacunarity=lacunarity, shape=noise_shape)
+
 
     # Video settings
+    # TODO: Optimize this! Use a larger batch size to speed this up
+    # Noise shape
     num_frames = int(np.rint(fps * duration_sec))
+    batch_size = 1
+    noise_shape = (num_frames, batch_size, channels, height // downsample_factor, width // downsample_factor)
+
+    smoothing_sec = min(duration_sec / 10.0, 3.0)
+
+    # start_code = torch.randn(noise_shape, device=device)
+    start_code = np.random.RandomState(seed).randn(*noise_shape)
+    start_code = scipy.ndimage.gaussian_filter(start_code, sigma=[smoothing_sec * fps, 0, 0, 0, 0], mode='wrap')
+    start_code /= np.sqrt(np.mean(np.square(start_code)))
+    start_code = torch.from_numpy(start_code).to(device)
+
+    if half:
+        start_code = start_code.half()
+
+    # start_code_copy = copy.deepcopy(start_code)
     n_digits = int(np.log10(num_frames)) + 1  # Number of digits for naming each frame
 
     r = torch.arange(start=0, end=2*np.pi, step=2*np.pi/num_frames, device=device)
@@ -206,10 +226,11 @@ def main(ctx,
                     uc = model.get_learned_conditioning(batch_size * [''])
 
                 c = model.get_learned_conditioning(prompt)
-                shape = noise_shape[1:]
+                shape = noise_shape[2:]
 
                 for idx, frame in enumerate(tqdm(range(num_frames), desc='Interpolating...', unit='frame')):
-                    start_code = start_code_copy.clone() + perlin_strength[idx] * perlin_noise
+                    # start_code = start_code_copy.clone() + perlin_strength[idx] * perlin_noise
+                    # start_code = start_code[idx]
 
                     if deterministic:
                         os.environ["PL_GLOBAL_SEED"] = str(seed)
@@ -226,7 +247,7 @@ def main(ctx,
                                                      unconditional_guidance_scale=scale,
                                                      unconditional_conditioning=uc,
                                                      eta=ddim_eta,
-                                                     x_T=start_code,
+                                                     x_T=start_code[idx],
                                                      disable_inner_tqdm=True)
 
                     x_samples_ddim = model.decode_first_stage(samples_ddim)
