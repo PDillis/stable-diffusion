@@ -93,6 +93,7 @@ def make_run_dir(outdir: Union[str, os.PathLike], desc: str, dry_run: bool = Fal
 @click.option('--seed', type=click.INT, help='Global seed for random number generator.', default=0, show_default=True)
 @click.option('--config', type=click.Path(exists=True), help='Path to config file which constructs the model.', default=os.path.join(os.getcwd(), 'configs', 'stable-diffusion', 'v1-inference.yaml'), show_default=True)
 @click.option('--ckpt', type=click.Path(exists=True), help='Path to checkpoint of the model.', default=os.path.join('models', 'ldm', 'stable-diffusion-v1', 'model.ckpt'), show_default=True)
+@click.option('--half', is_flag=True, help='Use half precision/fp16.')
 @click.option('--precision', type=click.Choice(['full', 'autocast']), help='Evaluate the model at this precision.', default='autocast', show_default=True)
 @click.option('--scale', type=click.FLOAT, help='Unconditional guidance scale: eps = eps(x, empty) + scale * (eps(x, cond) - eps(x, empty)).', default=7.5, show_default=True)
 # Image synthesis options
@@ -125,6 +126,7 @@ def main(ctx,
          seed: int,
          config: Union[str, os.PathLike],
          ckpt: Union[str, os.PathLike],
+         half: bool,
          precision: str,
          scale: float,
          plms: bool,
@@ -161,12 +163,6 @@ def main(ctx,
     # Load config and model
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    config = OmegaConf.load(config)
-    model = load_model_from_config(config, ckpt).to(device)
-
-    # Sampler; use PLMS or DDIM
-    sampler = PLMSSampler(model, verbose=False) if plms else DDIMSampler(model, verbose=False)
-
     # Precision scope
     precision_scope = autocast if precision == 'autocast' else nullcontext
 
@@ -185,7 +181,6 @@ def main(ctx,
     perlin_noise = generate_perlin_noise(seed=perlin_seed, device=device, persistence=persistence,
                                          lacunarity=lacunarity, shape=noise_shape)
     start_code = torch.randn(noise_shape, device=device)
-    start_code_copy = copy.deepcopy(start_code)
 
     # Video settings
     num_frames = int(np.rint(fps * duration_sec))
@@ -194,12 +189,25 @@ def main(ctx,
     r = torch.arange(start=0, end=2*np.pi, step=2*np.pi/num_frames, device=device)
     perlin_strength = torch.sin(r) * (max_perlin_strength - min_perlin_strength) + min_perlin_strength
 
+    config = OmegaConf.load(config)
+    model = load_model_from_config(config, ckpt).to(device)
+
+    # Half precision
+    if half:
+        model = model.half()
+        start_code = start_code.half()
+
+    # Copy for later use
+    start_code_copy = copy.deepcopy(start_code)
+
+    # Sampler; use PLMS or DDIM
+    sampler = PLMSSampler(model, verbose=False) if plms else DDIMSampler(model, verbose=False)
+
+
     # Let's get this prompt
     with torch.no_grad():
         with precision_scope('cuda'):
             with model.ema_scope():
-                all_samples = list()
-
                 # Unconditional conditioning
                 uc = None
                 if scale != 1.0:
@@ -210,6 +218,7 @@ def main(ctx,
 
                 for idx, frame in enumerate(tqdm(range(num_frames), desc='Interpolating...', unit='frame')):
                     start_code = start_code_copy.clone() + perlin_strength[idx] * perlin_noise
+                    start_code = (start_code - start_code.mean()) / start_code.std()  # Normalize
 
                     if deterministic:
                         os.environ["PL_GLOBAL_SEED"] = str(seed)
@@ -234,16 +243,12 @@ def main(ctx,
                     x_samples_ddim = 255. * rearrange(x_samples_ddim[0].cpu().numpy(), 'c h w -> h w c')
                     Image.fromarray(x_samples_ddim.astype(np.uint8)).save(os.path.join(run_dir, f'frame_{idx:0{n_digits}d}.jpg'))
 
-                    all_samples.append(x_samples_ddim)
-
     # Save the final video
     print('Saving video...')
-    if os.name == 'nt':  # No glob pattern for Windows
-        stream = ffmpeg.input(os.path.join(run_dir, f'frame_%0{n_digits}d.jpg'), framerate=fps)
-    else:
-        stream = ffmpeg.input(os.path.join(run_dir, 'frame_*.jpg'), pattern_type='glob', framerate=fps)
+    ffmpeg_command = r'/usr/bin/ffmpeg' if os.name != 'nt' else r'C:\\Ffmpeg\\bin\\ffmpeg.exe'
+    stream = ffmpeg.input(os.path.join(run_dir, f'frame_%0{n_digits}d.jpg'), framerate=fps)
     stream = ffmpeg.output(stream, os.path.join(run_dir, 'perlin_interpolation.mp4'), crf=20, pix_fmt='yuv420p')
-    ffmpeg.run(stream, capture_stdout=True, capture_stderr=True)  # I dislike ffmpeg's console logs, so I turn them off
+    ffmpeg.run(stream, capture_stdout=True, capture_stderr=True, cmd=ffmpeg_command)
 
     # Save the reversed video apart from the original one, so the user can compare both
     if reverse_video:
